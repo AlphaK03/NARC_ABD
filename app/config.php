@@ -1,12 +1,20 @@
 <?php
-// app/config.php
-namespace App;
+declare(strict_types=1);
 
-const APP_DEBUG = true;
-const BASE_URL  = '/mybd.com/public'; // ajusta según tu ruta/localhost
-
-// DB WAMP por defecto (ajusta si cambiaste la clave)
-const DB_HOST = '127.0.0.1';
-const DB_NAME = 'mybd_gobierno';
-const DB_USER = 'root';
-const DB_PASS = '';
+return [
+  'db' => [
+    'dsn'  => 'mysql:host=localhost;dbname=cranwhfb_mybd;charset=utf8mb4',
+    'user' => 'cranwhfb_team', 
+    'pass' => 'CRAN_root',      
+    'options' => [
+      PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+      PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+      PDO::ATTR_EMULATE_PREPARES   => false,
+    ]
+  ],
+  'paths' => [
+    'base'   => '',
+    'public' => '',
+    'assets' => '/assets',
+  ],
+];

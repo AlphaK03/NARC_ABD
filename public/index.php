@@ -1,23 +1,24 @@
 <?php
-// public/index.php
 declare(strict_types=1);
 
-require __DIR__ . '/../app/config.php';
-require __DIR__ . '/../app/db.php';
-require __DIR__ . '/../app/controllers/EvaluacionController.php';
+define('BASE_PATH', __DIR__); // /home/cranwhfb/domains/cran.whf.bz/public_html
 
-use App\Controllers\EvaluacionController;
+// Carga SIEMPRE estos archivos desde /public_html/app
+$config = require BASE_PATH . '/app/config.php';
+require BASE_PATH . '/app/db.php';        // crea $pdo usando ESE config.php
+require BASE_PATH . '/app/repos.php';
+require BASE_PATH . '/app/logic.php';
+require BASE_PATH . '/app/preguntas.php';
 
-$pdo = App\db();
-$ctl = new EvaluacionController($pdo);
+// Catálogos
+$actividades = getActividades($pdo);
+$requisitos  = getRequisitos($pdo);
 
-$route = $_GET['r'] ?? 'evaluaciones/nueva';
-
-switch ($route) {
-  case 'evaluaciones/nueva':   $ctl->form();    break;
-  case 'evaluaciones/guardar': $ctl->guardar(); break;
-  case 'evaluaciones':         $ctl->listar();  break;
-  default:
-    http_response_code(404);
-    echo '404';
+// Procesar POST
+$feedback = null;
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+  $feedback = procesarFormulario($pdo, $_POST);
 }
+
+// Render
+require BASE_PATH . '/app/views/form.php';

@@ -1,31 +1,38 @@
-/* assets/css/style.css */
+/* Reset y tipografía */
 body {
     font-family: Arial, sans-serif;
-    background-color: #f4f6f8;
+    background-color: #f4f6f8; /* más claro que el gris Bootstrap */
     color: #333;
     margin: 0;
     padding: 0;
 }
 
+/* Contenedor principal */
 .container {
     width: 90%;
     max-width: 1200px;
     margin: auto;
     padding: 20px;
+    background: #fff;               /* caja blanca para contraste */
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
 }
 
+/* Encabezados */
 h1, h2, h3 {
     color: #2c3e50;
 }
 
+/* Tablas */
 table {
     width: 100%;
     border-collapse: collapse;
     margin-bottom: 20px;
+    background: #fff;
 }
 
 table thead {
-    background-color: #3498db;
+    background-color: #3498db; /* azul fuerte */
     color: white;
 }
 
@@ -35,15 +42,51 @@ table th, table td {
     text-align: center;
 }
 
-button, input[type="submit"] {
-    background-color: #3498db;
-    color: white;
+/* Botones generales */
+button,
+input[type="submit"],
+.btn-primary {
+    background-color: #3498db !important;
+    color: white !important;
     border: none;
     padding: 8px 16px;
     border-radius: 4px;
     cursor: pointer;
+    transition: background-color .2s ease-in-out;
 }
 
-button:hover, input[type="submit"]:hover {
-    background-color: #2980b9;
+button:hover,
+input[type="submit"]:hover,
+.btn-primary:hover {
+    background-color: #2980b9 !important;
+}
+
+/* Botones secundarios */
+.btn-outline-secondary {
+    border: 1px solid #3498db;
+    color: #3498db;
+    background: white;
+}
+
+.btn-outline-secondary:hover {
+    background: #3498db;
+    color: white;
+}
+
+/* Badge de la marca (ajustado al azul) */
+.brand-badge {
+    background: #eaf2fb;
+    color: #3498db;
+    padding: 6px 12px;
+    border-radius: 12px;
+    font-weight: 600;
+}
+
+/* Footer sticky actions */
+.sticky-actions {
+    position: sticky;
+    bottom: 0;
+    background: #fff;
+    padding: 12px;
+    border-top: 1px solid #e9ecef;
 }
