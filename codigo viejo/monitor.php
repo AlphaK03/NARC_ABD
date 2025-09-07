@@ -1,54 +1,71 @@
 <?php
 /************************************************************
- * SGA MONITOR – Single file (WAMP + OCI8 + PDO-MySQL)
- * - Lee SGA (Buffer Cache) por DBLINK (Oracle)
- * - Muestra gráfico realtime + min/máx/promedio
- * - Registra alertas en MySQL si used_pct ≥ crítico (SP MySQL)
- * - Lista alertas recientes (MySQL) en la UI
+ * SGA MONITOR – Multi-cliente (via $_SESSION['dblink_cfg'])
+ * - Carga credenciales Oracle por ?client=ID (definido en monitors.php)
+ * - Lee SGA/BufferCache local o por DBLINK
+ * - UI realtime + min/máx/promedio
+ * - Registra alertas en MySQL con SP (sp_create_sga_alert)
  ************************************************************/
+
+// Seguridad básica (igual que en monitors.php)
+session_start();
+if (!($_SESSION['auth'] ?? false)) { header("Location: index.php"); exit; }
+
+// === Obtener el cliente solicitado ===
+$CLIENT_ID = $_GET['client'] ?? '';
+$dblinks   = $_SESSION['dblink_cfg'] ?? [];
+$clientCfg = $dblinks[$CLIENT_ID] ?? null;
+
+if (!$CLIENT_ID || !$clientCfg) {
+  http_response_code(400);
+  echo "<!doctype html><meta charset='utf-8'><body style='font:14px system-ui'>
+  <h3>Error</h3><p>No se encontró el cliente solicitado (<code>" . htmlspecialchars($CLIENT_ID) . "</code>).
+  Vuelve a <a href='monitors.php'>Monitores</a> y agrega o selecciona un DBLINK válido.</p></body>";
+  exit;
+}
 
 // Evitar que avisos/notice rompan el JSON
 ini_set('display_errors', '0');
 error_reporting(E_ALL & ~E_NOTICE & ~E_WARNING);
 
-//////////////////////////
-// 0) CONFIG
-//////////////////////////
+// =========================
+// 0) CONFIG (por defecto)
+// =========================
 $CFG = [
-  // Oracle local (dblink hacia la base remota)
+  // Oracle (sobrescrito desde sesión por cliente)
   'ora' => [
-    'username' => 'CRAN_CLIENT1',
-    'password' => 'Client1#2025',
-    'dsn'      => '//localhost:1521/XEPDB1',
-    'charset'  => 'AL32UTF8',
-    'dblink'   => 'DBLINK_CRAN_CLIENT1',
+    'username' => $clientCfg['username'] ?? '',
+    'password' => $clientCfg['password'] ?? '',
+    'dsn'      => $clientCfg['dsn']      ?? '',
+    'charset'  => $clientCfg['charset']  ?? 'AL32UTF8',
+    'dblink'   => $clientCfg['dblink']   ?? '',
   ],
 
-  // MySQL local para persistencia
+  // MySQL local para persistencia (ajusta si ocupas)
   'mysql' => [
     'dsn'      => 'mysql:host=127.0.0.1;dbname=mybd_gobierno;charset=utf8mb4',
     'username' => 'root',
     'password' => '',
   ],
 
-  // Parámetros del monitor
+  // Parámetros del monitor (se pueden override por query)
   'refresh_secs'  => 3,
   'crit_pct'      => 85,
   'warn_pct'      => 75,
   'hard_crit_pct' => 90,
   'alerts_limit'  => 50,
 
-  // Anti-lluvia (cooldown en segundos)
-  'cooldown_secs' => 300, // 5 min
+  // Opcional: cooldown para no “llover” alertas
+  'cooldown_secs' => 300,
 ];
 
-// overrides por querystring (opcional)
+// Overrides por querystring (opcional)
 if (isset($_GET['crit']))    $CFG['crit_pct']     = max(0, min(100, floatval($_GET['crit'])));
 if (isset($_GET['refresh'])) $CFG['refresh_secs'] = max(1, intval($_GET['refresh']));
 
-//////////////////////////
+// =========================
 // 1) HELPERS DB
-//////////////////////////
+// =========================
 function ora_connect(array $c) {
   $conn = @oci_connect($c['username'], $c['password'], $c['dsn'], $c['charset']);
   if (!$conn) { $e = oci_error(); throw new RuntimeException('Oracle: '.($e['message'] ?? 'unknown')); }
@@ -71,7 +88,6 @@ function ora_all($conn, string $sql, int $maxRows = 500) {
   oci_free_statement($stid);
   return $rows;
 }
-
 function my_connect(array $c): PDO {
   $pdo = new PDO($c['dsn'], $c['username'], $c['password'], [
     PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
@@ -79,7 +95,6 @@ function my_connect(array $c): PDO {
   ]);
   return $pdo;
 }
-
 function fnum($v) { return $v!==null ? floatval($v) : 0.0; }
 function json_response($data, int $code=200){
   http_response_code($code);
@@ -88,55 +103,55 @@ function json_response($data, int $code=200){
   exit;
 }
 
-//////////////////////////
-// 2) API ENDPOINTS
-//////////////////////////
+// =========================
+/* 2) API ENDPOINTS */
+// =========================
 $action = $_GET['action'] ?? '';
 
 if ($action === 'metrics') {
   try {
-    $ora    = ora_connect($CFG['ora']);
-    $dblink = $CFG['ora']['dblink'];
-    if (!$dblink) throw new RuntimeException('DBLINK no configurado');
+    $ora     = ora_connect($CFG['ora']);
+    $dblink  = trim($CFG['ora']['dblink'] ?? '');
+    $L       = $dblink ? ('@'.$dblink) : '';
 
     // ---- Parámetros de lectura/alerta ----
     $mode    = strtoupper($_GET['mode'] ?? 'BCHR');             // 'BCHR' (default) o 'PRS'
-    $scale   = max(1.0, floatval($_GET['scale'] ?? 20.0));      // factor para “amplificar” el gráfico
+    $scale   = max(0.1, floatval($_GET['scale'] ?? 1.0));       // default más sano
     $prscrit = max(1.0, floatval($_GET['prscrit'] ?? 800.0));   // PRS equivalente a 100%
     $critUI  = floatval($_GET['crit'] ?? $CFG['crit_pct']);     // umbral de alerta (sobre el valor escalado)
 
-    // ---- 1) SGA global (siempre vía DBLINK) ----
+    // ---- 1) SGA global (local o por DBLINK) ----
     $sga = ora_row($ora, "
       SELECT
         MAX(CASE WHEN name IN ('SGA Target','Total SGA Size','Maximum SGA Size') THEN bytes END) AS sga_total,
         MAX(CASE WHEN name IN ('Free SGA Memory','Free SGA Memory Available')   THEN bytes END) AS sga_free
-      FROM sys.v_\$sgainfo@$dblink
+      FROM sys.v_\$sgainfo$L
     ");
     $sga_total = fnum($sga['SGA_TOTAL'] ?? 0);
     $sga_free  = fnum($sga['SGA_FREE']  ?? 0);
     $sga_used  = max($sga_total - $sga_free, 0);
 
-    // ---- 2) Métricas dinámicas (ventana 1 min, siempre vía DBLINK) ----
+    // ---- 2) Métricas dinámicas (ventana 1 min) ----
     $mrows = ora_all($ora, "
       SELECT UPPER(metric_name) AS metric_name, value
-      FROM   sys.v_\$sysmetric@$dblink
+      FROM   sys.v_\$sysmetric$L
       WHERE  group_id = 2
       AND    metric_name IN ('Buffer Cache Hit Ratio','Physical Reads Per Sec')
     ", 10);
 
     $bchr = null; $prs = null;
     foreach ($mrows as $r) {
-      if ($r['METRIC_NAME'] === 'BUFFER CACHE HIT RATIO') $bchr = fnum($r['VALUE']);
-      if ($r['METRIC_NAME'] === 'PHYSICAL READS PER SEC') $prs  = fnum($r['VALUE']);
+      if (($r['METRIC_NAME'] ?? '') === 'BUFFER CACHE HIT RATIO') $bchr = fnum($r['VALUE'] ?? 0);
+      if (($r['METRIC_NAME'] ?? '') === 'PHYSICAL READS PER SEC') $prs  = fnum($r['VALUE'] ?? 0);
     }
 
-    // --- BCHR de respaldo (aún vía DBLINK) usando solo misses del buffer (no direct path)
+    // --- BCHR de respaldo (usando misses del buffer)
     if ($bchr === null) {
       $stat = ora_row($ora, "
         SELECT
           SUM(CASE WHEN LOWER(name) IN ('db block gets','consistent gets') THEN value ELSE 0 END) AS logical_gets,
           SUM(CASE WHEN LOWER(name) = 'physical reads cache' THEN value ELSE 0 END)               AS phys_cache
-        FROM sys.v_\$sysstat@$dblink
+        FROM sys.v_\$sysstat$L
         WHERE LOWER(name) IN ('db block gets','consistent gets','physical reads cache')
       ");
       $logical   = fnum($stat['LOGICAL_GETS'] ?? 0);
@@ -150,28 +165,27 @@ if ($action === 'metrics') {
     if ($pressure_source === 'PRS') {
       $pressure_raw = 100.0 * $prs / $prscrit;       // mapea prscrit -> 100
     } else {
-      $pressure_raw = 100.0 - floatval($bchr);       // si BCHR baja, sube la presión
+      $pressure_raw = max(0.0, 100.0 - floatval($bchr)); // si BCHR baja, sube la presión
     }
-    $pressure_raw = max(0.0, $pressure_raw);
-    $used_pct     = min(100.0, $pressure_raw * $scale);  // escala para que se vea
+    $used_pct = min(100.0, $pressure_raw * $scale);      // escala para que se vea
 
-    // ---- 4) Payload (compat + campos nuevos) ----
+    // ---- 4) Payload ----
     $payload = [
       'ts'              => round(microtime(true)*1000),
       'pressure_source' => $pressure_source,
-      'pressure_raw'    => round($pressure_raw,2),    // 0..100 sin escala
+      'pressure_raw'    => round($pressure_raw,2),
       'scale'           => $scale,
       'prscrit'         => $prscrit,
       'bchr'            => round($bchr,2),
       'prs'             => round($prs,2),
 
-      'used_pct'        => round($used_pct,2),        // lo que graficas y evalúas
+      'used_pct'        => round($used_pct,2),
       'crit_pct'        => $critUI,
       'warn_pct'        => $CFG['warn_pct'],
-      'hard_crit_pct'   => $CFG['hard_crit_pct'] ?? 90,
+      'hard_crit_pct'   => $CFG['hard_crit_pct'],
       'is_critical'     => ($used_pct >= $critUI),
 
-      // Compat + SGA
+      // SGA
       'total_bytes'     => $sga_total,
       'used_bytes'      => $sga_used,
       'sga_target'      => $sga_total,
@@ -196,8 +210,8 @@ if ($action === 'metrics') {
 
         $stmt = $pdo->prepare("CALL sp_create_sga_alert(?,?,?,?,?,?,?, ?, @p_id_alert)");
         $stmt->execute([
-          $dblink,
-          round($used_pct,2),  // valor escalado (lo que “ves”)
+          ($dblink ?: '(local)'),
+          round($used_pct,2),
           $critUI,
           $sga_total,
           $sga_used,
@@ -217,13 +231,9 @@ if ($action === 'metrics') {
   }
 }
 
-
-
-
-
 if ($action === 'alerts') {
   try {
-    $pdo = my_connect($CFG['mysql']);
+    $pdo   = my_connect($CFG['mysql']);
     $limit = max(1, min(500, intval($_GET['limit'] ?? $CFG['alerts_limit'])));
     $stmt = $pdo->prepare("
       SELECT id_alert   AS id,
@@ -237,13 +247,15 @@ if ($action === 'alerts') {
              block_size,
              note
       FROM sga_alert_hdr
+      WHERE dblink = :dblink
       ORDER BY alert_ts DESC
       LIMIT :lim
     ");
+    $stmt->bindValue(':dblink', ($CFG['ora']['dblink'] ?: '(local)'), PDO::PARAM_STR);
     $stmt->bindValue(':lim', $limit, PDO::PARAM_INT);
     $stmt->execute();
     $rows = $stmt->fetchAll();
-    json_response(['rows'=>$rows]);
+    json_response(['rows'=>$rows, 'client'=>$CLIENT_ID]);
   } catch (Throwable $e) {
     json_response(['error' => $e->getMessage()], 500);
   }
@@ -252,7 +264,8 @@ if ($action === 'alerts') {
 if ($action === 'sessions') {
   try {
     $ora    = ora_connect($CFG['ora']);
-    $dblink = $CFG['ora']['dblink'];
+    $dblink = trim($CFG['ora']['dblink'] ?? '');
+    $L      = $dblink ? ('@'.$dblink) : '';
 
     $rows = ora_all($ora, "
       SELECT s.sid,
@@ -265,22 +278,22 @@ if ($action === 'sessions') {
              s.event,
              s.sql_id,
              sa.sql_text
-      FROM   sys.v_\$session@$dblink s
-      LEFT   JOIN sys.v_\$sqlarea@$dblink sa ON s.sql_id = sa.sql_id
+      FROM   sys.v_\$session$L s
+      LEFT   JOIN sys.v_\$sqlarea$L sa ON s.sql_id = sa.sql_id
       WHERE  s.username IS NOT NULL
       AND    s.status   = 'ACTIVE'
       ORDER  BY s.logon_time DESC
     ", 100);
 
-    json_response(['rows'=>$rows]);
+    json_response(['rows'=>$rows, 'client'=>$CLIENT_ID]);
   } catch (Throwable $e) {
     json_response(['error' => $e->getMessage()], 500);
   }
 }
 
-//////////////////////////
+// =========================
 // 3) HTML + JS (UI)
-//////////////////////////
+// =========================
 ?>
 <!doctype html>
 <html lang="es">
@@ -288,37 +301,18 @@ if ($action === 'sessions') {
 <meta charset="utf-8" />
 <title>SGA Monitor – Realtime</title>
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-
 <!-- Chart.js + adapter de tiempo (Luxon) -->
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/luxon@3"></script>
 <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1"></script>
-
-<style>
-  :root { --bg:#0b0f19; --card:#101626; --border:#1c2333; --fg:#e5e9f0; --muted:#aab3c5; }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);font:14px system-ui,Segoe UI,Roboto,Arial}
-  header{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;gap:12px;align-items:center;flex-wrap:wrap}
-  h3{margin:0;font-size:16px}
-  .small{color:var(--muted);font-size:12px}
-  .grid{display:grid;gap:14px;padding:14px;grid-template-columns:1fr}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:12px}
-  .pill{display:inline-block;padding:2px 8px;border-radius:999px;margin-left:8px;font-size:12px}
-  .ok{background:#1b4332} .warn{background:#7f6e05} .crit{background:#7f1d1d}
-  .row{display:flex;gap:10px;flex-wrap:wrap;margin:8px 0}
-  table{width:100%;border-collapse:collapse;margin-top:10px}
-  th,td{padding:8px;border-bottom:1px solid var(--border);vertical-align:top;text-align:left}
-  th{color:#c7d0e0;font-weight:600}
-  code{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace}
-  .btn{background:#172039;border:1px solid var(--border);color:var(--fg);padding:6px 10px;border-radius:8px;cursor:pointer}
-  .btn:disabled{opacity:.5;cursor:not-allowed}
-</style>
+<link rel="stylesheet" href="styles.css">
 </head>
 <body>
 <header>
   <div>
     <h3>SGA Monitor (Buffer Cache)</h3>
     <div class="small">
+      cliente: <code><?=htmlspecialchars($CLIENT_ID)?></code> ·
       dblink: <code><?=htmlspecialchars($CFG['ora']['dblink'])?></code> ·
       refresh: <code><?=intval($CFG['refresh_secs'])?>s</code> ·
       crítico: <code><?=intval($CFG['crit_pct'])?>%</code>
@@ -334,15 +328,14 @@ if ($action === 'sessions') {
     </div>
 
     <div class="row">
-  <div>Actual: <strong id="st_now">0.00%</strong></div>
-  <div>Promedio: <strong id="st_avg">0.00%</strong></div>
-  <div>Máximo: <strong id="st_max">0.00%</strong></div>
-  <div>Mínimo: <strong id="st_min">0.00%</strong></div>
-  <div>SGA Target: <strong id="st_cap">0.00 GB</strong></div>
-  <div>SGA Free: <strong id="st_free">0.00 GB</strong></div>
-  <div>SGA Used: <strong id="st_used">0.00 GB</strong></div>
-</div>
-
+      <div>Actual: <strong id="st_now">0.00%</strong></div>
+      <div>Promedio: <strong id="st_avg">0.00%</strong></div>
+      <div>Máximo: <strong id="st_max">0.00%</strong></div>
+      <div>Mínimo: <strong id="st_min">0.00%</strong></div>
+      <div>SGA Target: <strong id="st_cap">0.00 GB</strong></div>
+      <div>SGA Free: <strong id="st_free">0.00 GB</strong></div>
+      <div>SGA Used: <strong id="st_used">0.00 GB</strong></div>
+    </div>
 
     <div class="row">
       <button class="btn" id="btnSessions">Ver sesiones (on-demand)</button>
@@ -373,6 +366,7 @@ if ($action === 'sessions') {
 </div>
 
 <script>
+const CLIENT = <?=json_encode($CLIENT_ID)?>;
 const REFRESH = <?=intval($CFG['refresh_secs'])?>;
 const WARN = <?=intval($CFG['warn_pct'])?>, CRIT = <?=intval($CFG['crit_pct'])?>, HARD = <?=intval($CFG['hard_crit_pct'])?>;
 
@@ -383,7 +377,6 @@ const stMax   = document.getElementById('st_max');
 const stMin   = document.getElementById('st_min');
 const stCap   = document.getElementById('st_cap');
 const stFree  = document.getElementById('st_free');
-const stBlock = document.getElementById('st_block');
 const hint    = document.getElementById('hint');
 
 const wrapSess= document.getElementById('sessions');
@@ -435,9 +428,7 @@ const rtChart = new Chart(ctx, {
       tooltip: {
         mode: 'nearest',
         intersect: false,
-        callbacks: {
-          label: (ctx) => ` ${ctx.parsed.y?.toFixed(2)}%`
-        }
+        callbacks: { label: (ctx) => ` ${ctx.parsed.y?.toFixed(2)}%` }
       }
     },
     elements: { line: { borderJoinStyle: 'round' } }
@@ -446,25 +437,18 @@ const rtChart = new Chart(ctx, {
 
 function applyStrokeByPct(pct){
   const ds = rtChart.data.datasets[0];
-  if (pct >= HARD)      ds.borderColor = '#d90429'; // rojo
-  else if (pct >= WARN) ds.borderColor = '#f2a900'; // ámbar
-  else                  ds.borderColor = '#3cb371'; // verde
+  if (pct >= HARD)      ds.borderColor = '#d90429';
+  else if (pct >= WARN) ds.borderColor = '#f2a900';
+  else                  ds.borderColor = '#3cb371';
 }
-
 function pushPoint(tsMillis, pct){
   const labels = rtChart.data.labels;
   const data   = rtChart.data.datasets[0].data;
-
   labels.push(new Date(tsMillis));
   data.push(pct);
-
-  if (labels.length > MAX_POINTS) {
-    labels.shift();
-    data.shift();
-  }
+  if (labels.length > MAX_POINTS) { labels.shift(); data.shift(); }
   rtChart.update('none');
 }
-
 function fmtGB(b){ return (Number(b||0)/1024/1024/1024).toFixed(2); }
 function updatePill(pct){
   elPill.className = 'pill ' + (pct >= HARD ? 'crit' : (pct >= WARN ? 'warn' : 'ok'));
@@ -472,7 +456,10 @@ function updatePill(pct){
 }
 
 async function fetchJSON(url){
-  const r = await fetch(url + '&_=' + Date.now());
+  const hasQ = url.includes('?');
+  const sep  = hasQ ? '&' : '?';
+  const full = url + sep + 'client=' + encodeURIComponent(CLIENT) + '&_=' + Date.now();
+  const r = await fetch(full);
   if (!r.ok) throw new Error('HTTP ' + r.status);
   return r.json();
 }
@@ -494,7 +481,6 @@ async function tick(){
     stCap.textContent  = fmtGB(d.sga_target)+' GB';
     stFree.textContent = fmtGB(d.sga_free)+' GB';
     document.getElementById('st_used').textContent = fmtGB(d.sga_used)+' GB';
-
 
     updatePill(pct);
     hint.textContent = d.mysql_error
