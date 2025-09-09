@@ -31,3 +31,39 @@ function json_out($data, int $code=200) {
 }
 
 function fnum($v){ return $v!==null ? floatval($v) : 0.0; }
+
+// Helper: asegurar tablas auxiliares necesarias sin romper esquemas existentes
+function ensure_aux_tables(PDO $pdo) {
+  // Log de % usado para promedios
+  $pdo->exec("CREATE TABLE IF NOT EXISTS cran_used_log (
+    client_id INT NOT NULL,
+    ts DATETIME NOT NULL,
+    used_pct DECIMAL(6,2) NULL,
+    PRIMARY KEY (client_id, ts)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+  // Gate anti-lluvia de alertas
+  $pdo->exec("CREATE TABLE IF NOT EXISTS cran_alert_gate (
+    dblink VARCHAR(128) NOT NULL,
+    sga_type VARCHAR(16) NOT NULL,
+    last_level ENUM('OK','WARN','CRIT') NOT NULL DEFAULT 'OK',
+    last_used_pct DECIMAL(6,2) NULL,
+    last_saved_at DATETIME NULL,
+    PRIMARY KEY (dblink, sga_type)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+  // Uptime por cliente
+  $pdo->exec("CREATE TABLE IF NOT EXISTS cran_monitor_uptime (
+    client_id INT PRIMARY KEY,
+    started_at DATETIME NOT NULL,
+    last_reset_reason VARCHAR(32) DEFAULT 'start'
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+}
+
+// Helper: nivel de alerta
+function level_for($used, $warn, $crit) {
+  if ($used === null) return 'NA';
+  if ($crit !== null && $used >= $crit) return 'CRIT';
+  if ($warn !== null && $used >= $warn) return 'WARN';
+  return 'OK';
+}
